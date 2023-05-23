@@ -1,0 +1,150 @@
+
+// Please copy and paste this code in Google Earth Engine (https://code.earthengine.google.com/) or simply use the following link which is publicly availble (https://code.earthengine.google.com/f51af335b5100f8d4a80b21fb7c74ac7)
+
+// A function that scales and masks Landsat 8 (C2) surface reflectance images
+
+function prepSrL8(image) {
+  // Develop masks for unwanted pixels (fill, cloud, cloud shadow).
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0);
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  // Apply the scaling factors to the appropriate bands.
+  var getFactorImg = function(factorNames) {
+    var factorList = image.toDictionary().select(factorNames).values();
+    return ee.Image.constant(factorList);
+  };
+  var scaleImg = getFactorImg([
+    'REFLECTANCE_MULT_BAND_.|TEMPERATURE_MULT_BAND_ST_B10']);
+  var offsetImg = getFactorImg([
+    'REFLECTANCE_ADD_BAND_.|TEMPERATURE_ADD_BAND_ST_B10']);
+  var scaled = image.select('SR_B.|ST_B10').multiply(scaleImg).add(offsetImg);
+
+  // Replace original bands with scaled bands and apply masks.
+  return image.addBands(scaled, null, true)
+    .updateMask(qaMask).updateMask(saturationMask);
+}
+
+// introduce Tureky as geometry
+var geometry = ee.Geometry.Polygon([[[25.561718749999986,35.9821829705783],[45.77656249999998,35.9821829705783],
+[45.77656249999998,43.02448708285569],[25.561718749999986,43.02448708285569],[25.561718749999986,35.9821829705783]]]);
+
+
+//import Landsat-8 images as an ImageCollection
+
+var LL8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(geometry)
+    .filterDate('2016-01-01', '2020-12-31')
+    .map(prepSrL8)
+    .map(function(image){return image.select(['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7']).rename(['B1','B2','B3','B4','B5','B7'])});
+
+
+// Function to calculate input features (e.g., spectral indices and topographical data). 
+var addIndices = function(img) {
+  var NDVI = img.normalizedDifference(['B4', 'B3']).rename('NDVI');
+  var NDWI = img.normalizedDifference(['B2', 'B4']).rename('NDWI');
+  var NDBI = img.normalizedDifference(['B5', 'B4']).rename('NDBI');
+  var WBI = img.select('B1').divide(img.select('B4')).rename('WBI');
+  var MSAVI = img.expression(
+    '1/2 * ((2*NIR+1) - ((2*NIR+1)**2 - 8*(NIR-RED))**(1/2))',{
+      'NIR': img.select('B4'),
+      'RED': img.select('B3')
+  }).rename(['MSAVI']);
+  var SAVI = img.expression(
+    '((NIR-RED) / (RED+NIR+0.5))*(1.5)', {
+      'RED': img.select('B3'),
+      'NIR': img.select('B4')
+  }).rename(['SAVI']);
+  var OSAVI = img.expression(
+    '((NIR-RED) / (RED+NIR+0.16))', {
+      'RED': img.select('B3'),
+      'NIR': img.select('B4')
+  }).rename(['OSAVI']);
+    var SATVI = img.expression(
+    '(((SWIR1-RED) / (SWIR1+RED+0.5))*1.5) - (SWIR2/2)',{
+      'SWIR1': img.select('B5'),
+      'RED': img.select('B3'),
+      'SWIR2': img.select('B7')
+    }).rename(['SATVI']);
+  var BSI = img.expression(
+    '((SWIR2+RED)-(NIR+BLUE))/((SWIR2+RED)+(NIR+BLUE))',{
+      'SWIR2': img.select('B7'),
+      'NIR': img.select('B4'),
+      'RED': img.select('B3'),
+      'BLUE':img.select('B1')
+  }).rename(['BSI']);
+     var EVI = img.expression(
+    '2.5 * ((NIR - RED)/(NIR + 6 * RED - 7.5 * BLUE))', {
+      'NIR':img.select('B4'),
+      'RED':img.select('B3'),
+      'BLUE':img.select('B1')}).rename ('EVI');
+     
+  return img.addBands(NDVI).addBands(NDWI).addBands(NDBI).addBands(MSAVI).addBands(SATVI)
+       .addBands(BSI).addBands(EVI).addBands(WBI).addBands(OSAVI).addBands(SAVI);
+};
+
+
+var lights = ee.Image('NOAA/DMSP-OLS/NIGHTTIME_LIGHTS/F182013')
+.select(['stable_lights']).divide(63).resample('bilinear').clip(geometry).rename('lights');
+
+
+var srtm30 = ee.Image('USGS/SRTMGL1_003');
+var slope30 = ee.Terrain.slope(srtm30);
+var aspect30 = ee.Terrain.aspect(srtm30);
+
+var bandsAll=  ['B1','B2', 'B3', 'B4', 'B5', 'B7','elevation','NDVI','slope',
+              'NDWI','NDBI','MSAVI','EVI','lights','WBI'];
+
+
+// Add indices bands to image collection
+var LL8a = LL8.map(addIndices);
+var LL83 = LL8a.median().addBands(srtm30.select('elevation')).addBands(lights).addBands(slope30).addBands(aspect30);
+print (LL83);
+
+
+print ('Train', DataTrain.toList(100000));
+print ('valid', DataValid.toList(100000));
+
+
+var DataSamp = LL83.select(bandsAll).sampleRegions({
+		collection: DataTrain, 
+		properties: ['landcover'], 
+		scale: 900,
+		tileScale: 16,
+		geometries:true
+		});
+
+
+//Create a seperate random forest model for each zone
+var KoppLcClas=ee.List([11,12,13,14,15,16,17,18,19])
+
+var AdapClassif = KoppLcClas.map(function(numbb){
+	
+	var zoneS = zones.filter(ee.Filter.eq('zone',numbb)) 
+	var zonePoints = DataSamp.filterBounds(zoneS);
+	var zoneLandsat = LL83.clip(zoneS)
+	
+	var classifier = ee.Classifier.smileRandomForest({numberOfTrees:200,variablesPerSplit: 4})
+	.train({
+	features: zonePoints, 
+	classProperty: 'landcover',
+	inputProperties: bandsAll,
+	});
+ 
+	var classified = zoneLandsat.select(bandsAll).classify(classifier);					
+      return classified
+  })
+
+//print(AdapClassif.size())
+var AdapClassif2 = ee.ImageCollection.fromImages(AdapClassif).mosaic();
+//print(AdapClassif2)
+
+var validData = AdapClassif2.sampleRegions({
+		collection: DataValid, 
+		properties: ['landcover'], 
+		scale: 900,
+		tileScale: 16
+	});
+	
+
+var confMatr = validData.errorMatrix('landcover', 'classification');
+print('Overal Accuracy',confMatr.accuracy());
